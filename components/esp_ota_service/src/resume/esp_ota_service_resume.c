@@ -19,6 +19,9 @@
 #define KEY_URI_FMT      "u%d"
 #define KEY_WRITTEN_FMT  "w%d"
 #define KEY_INDEX_FMT    "i%d"
+#define KEY_SIZE_FMT     "s%d"
+#define KEY_HASH_FMT     "h%d"
+#define KEY_HASH_VALID_FMT "v%d"
 
 static const char *TAG = "esp_ota_svc_resume";
 
@@ -71,6 +74,28 @@ esp_err_t esp_ota_service_resume_save(const esp_ota_service_resume_point_t *poin
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Save failed: nvs_set_i8(%s) returned %s", key, esp_err_to_name(ret));
         goto done;
+    }
+
+    make_key(key, sizeof(key), KEY_SIZE_FMT, point->item_index);
+    ret = nvs_set_u32(handle, key, point->image_size);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Save failed: nvs_set_u32(%s) returned %s", key, esp_err_to_name(ret));
+        goto done;
+    }
+
+    make_key(key, sizeof(key), KEY_HASH_VALID_FMT, point->item_index);
+    ret = nvs_set_u8(handle, key, point->has_sha256 ? 1 : 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Save failed: nvs_set_u8(%s) returned %s", key, esp_err_to_name(ret));
+        goto done;
+    }
+    if (point->has_sha256) {
+        make_key(key, sizeof(key), KEY_HASH_FMT, point->item_index);
+        ret = nvs_set_blob(handle, key, point->sha256, sizeof(point->sha256));
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Save failed: nvs_set_blob(%s) returned %s", key, esp_err_to_name(ret));
+            goto done;
+        }
     }
 
     ret = nvs_commit(handle);
@@ -130,8 +155,45 @@ esp_err_t esp_ota_service_resume_load(int item_index, esp_ota_service_resume_poi
         goto done;
     }
 
-    ESP_LOGI(TAG, "Resume point loaded [idx=%d]: written=%" PRIu32 " uri=%.64s...",
-             point->item_index, point->written_bytes, point->uri);
+    /* Size/hash were added after the original URI-only resume record.  Treat
+     * missing optional identity fields as a legacy record; callers that know
+     * the expected identity will reject it before using the offset. */
+    make_key(key, sizeof(key), KEY_SIZE_FMT, item_index);
+    ret = nvs_get_u32(handle, key, &point->image_size);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        point->image_size = 0;
+        ret = ESP_OK;
+    } else if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Load failed: nvs_get_u32(%s) returned %s", key, esp_err_to_name(ret));
+        goto done;
+    }
+
+    uint8_t has_sha256 = 0;
+    make_key(key, sizeof(key), KEY_HASH_VALID_FMT, item_index);
+    ret = nvs_get_u8(handle, key, &has_sha256);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        ret = ESP_OK;
+    } else if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Load failed: nvs_get_u8(%s) returned %s", key, esp_err_to_name(ret));
+        goto done;
+    }
+    point->has_sha256 = has_sha256 != 0;
+    if (point->has_sha256) {
+        size_t hash_len = sizeof(point->sha256);
+        make_key(key, sizeof(key), KEY_HASH_FMT, item_index);
+        ret = nvs_get_blob(handle, key, point->sha256, &hash_len);
+        if (ret != ESP_OK || hash_len != sizeof(point->sha256)) {
+            ESP_LOGW(TAG, "Load failed: incomplete SHA-256 identity for item %d", item_index);
+            ret = ESP_ERR_NVS_NOT_FOUND;
+            goto done;
+        }
+    }
+
+    ESP_LOGI(TAG,
+             "Resume point loaded [idx=%d]: written=%" PRIu32 " size=%" PRIu32
+             " sha256=%d uri=%.64s...",
+             point->item_index, point->written_bytes, point->image_size,
+             point->has_sha256, point->uri);
 
 done:
     nvs_close(handle);
@@ -158,7 +220,8 @@ esp_err_t esp_ota_service_resume_clear(int item_index)
     /* Best-effort: erase_key returns NOT_FOUND if that specific key does not exist.
      * We tolerate NOT_FOUND on each of the three keys independently. */
     char key[16];
-    const char *fmts[] = {KEY_URI_FMT, KEY_WRITTEN_FMT, KEY_INDEX_FMT};
+    const char *fmts[] = {KEY_URI_FMT, KEY_WRITTEN_FMT, KEY_INDEX_FMT,
+                          KEY_SIZE_FMT, KEY_HASH_FMT, KEY_HASH_VALID_FMT};
     for (size_t i = 0; i < sizeof(fmts) / sizeof(fmts[0]); i++) {
         make_key(key, sizeof(key), fmts[i], item_index);
         esp_err_t er = nvs_erase_key(handle, key);

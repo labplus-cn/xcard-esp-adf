@@ -201,6 +201,11 @@ typedef struct esp_ota_upgrade_item {
                                                    *   bootloader targets erase the whole partition on open()
                                                    *   and therefore cannot be resumed: only the app target
                                                    *   and sources with random-access seek currently qualify. */
+    uint32_t                    expected_size;    /*!< Optional exact image size used to validate a persisted
+                                                   *   resume record.  Zero disables the size comparison. */
+    bool                        has_expected_sha256; /*!< When true, expected_sha256 is persisted with the
+                                                     *   resume record and must match before resuming. */
+    uint8_t                     expected_sha256[32]; /*!< Optional expected image SHA-256. */
 } esp_ota_upgrade_item_t;
 
 /**
@@ -273,15 +278,21 @@ esp_err_t esp_ota_service_create(const esp_ota_service_cfg_t *cfg, esp_ota_servi
 /**
  * @brief  Destroy an OTA service instance and free all resources
  *
- *         Calls esp_service_stop() to abort any in-progress upgrade, destroys the
+ *         Calls esp_service_stop() to abort any in-progress upgrade, then destroys the
  *         source/target/verifier/checker instances in the current upgrade list, deinits the
- *         ADF service base, and frees the service object.
+ *         ADF service base, and frees the service object.  If the OTA worker has not
+ *         acknowledged its exit within the configured stop timeout, no resource is
+ *         destroyed and this function returns @c ESP_ERR_TIMEOUT.  Keep @p svc valid
+ *         and call this function again after the worker has stopped.
  *
  * @param[in]  svc  Service handle obtained from esp_ota_service_create()
  *
  * @return
  *       - ESP_OK               On success
  *       - ESP_ERR_INVALID_ARG  If svc is NULL
+ *       - ESP_ERR_TIMEOUT      If the worker has not yet exited; all resources remain owned by the service
+ *       - Other                Error returned by the underlying service stop/deinitialization operation;
+ *                              resources remain valid for a later retry
  */
 esp_err_t esp_ota_service_destroy(esp_ota_service_t *svc);
 
@@ -298,8 +309,9 @@ esp_err_t esp_ota_service_destroy(esp_ota_service_t *svc);
  *
  *         If a previous list exists, its source/target/verifier/checker destroy()
  *         functions are called before the list is replaced. Any saved NVS resume
- *         records are cleared at this point, because the new list may not match
- *         the previous item layout.
+ *         records are retained at this point.  Each resumable item validates
+ *         its URI, size, and optional SHA-256 identity before using a record;
+ *         unrelated or legacy records are ignored safely.
  *
  *         Allowed only while the service is in INITIALIZED or PAUSED. Not allowed
  *         in RUNNING while the worker is downloading.
@@ -313,8 +325,9 @@ esp_err_t esp_ota_service_destroy(esp_ota_service_t *svc);
  *       - ESP_ERR_INVALID_ARG    If svc/list is NULL, count <= 0, item uri/source/target is NULL, or a uri
  *                                exceeds the resume store's capacity (255 chars)
  *       - ESP_ERR_INVALID_STATE  If called while the service is neither INITIALIZED nor PAUSED
- *       - ESP_ERR_NOT_SUPPORTED  If item.resumable=true but the source has no seek() or the target has
- *                                no set_write_offset() (data / bootloader targets cannot resume)
+ *       - ESP_ERR_NOT_SUPPORTED  If item.resumable=true but the source has no seek(), the target has
+ *                                no set_write_offset(), or a resumable verifier item has no target
+ *                                read-back hook (data / bootloader targets cannot resume safely)
  *       - ESP_ERR_NO_MEM         If the list or deep-copied strings cannot be allocated
  */
 esp_err_t esp_ota_service_set_upgrade_list(esp_ota_service_t *svc, const esp_ota_upgrade_item_t *list, int count);

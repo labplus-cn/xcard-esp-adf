@@ -98,6 +98,24 @@ typedef struct esp_ota_service_source {
     esp_err_t (*close)(struct esp_ota_service_source *self);
 
     /**
+     * @brief  Request that an in-flight read operation stop without destroying the source
+     *
+     * The OTA service invokes this hook from its stop caller before waiting for
+     * the worker task.  Implementations must make the blocked operation return
+     * promptly, but must not call @c close() or @c destroy(), because those
+     * operations remain owned by the OTA worker after it has left @c read().
+     * Set to NULL when the source has no controlled cancellation mechanism.
+     *
+     * @param[in]  self  Source instance
+     *
+     * @return
+     *       - ESP_OK     Cancellation was requested or the source is already idle
+     *       - ESP_ERR_*  The request could not be issued; the service still waits
+     *                    for the worker before releasing any resource.
+     */
+    esp_err_t (*cancel)(struct esp_ota_service_source *self);
+
+    /**
      * @brief  Destroy the source instance and free all allocated memory
      *
      *         Called by the OTA service when the upgrade list is replaced or destroyed.

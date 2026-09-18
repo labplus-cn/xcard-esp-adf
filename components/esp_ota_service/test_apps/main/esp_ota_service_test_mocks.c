@@ -27,6 +27,7 @@ static esp_ota_service_mock_counters_t s_counters;
 void esp_ota_service_mock_counters_reset(void)
 {
     atomic_store(&s_counters.src_destroyed, 0);
+    atomic_store(&s_counters.src_cancelled, 0);
     atomic_store(&s_counters.tgt_destroyed, 0);
     atomic_store(&s_counters.chk_destroyed, 0);
     atomic_store(&s_counters.ver_destroyed, 0);
@@ -40,6 +41,7 @@ esp_ota_service_mock_counters_t esp_ota_service_mock_counters_snapshot(void)
 {
     esp_ota_service_mock_counters_t out = {
         .src_destroyed = ATOMIC_VAR_INIT(atomic_load(&s_counters.src_destroyed)),
+        .src_cancelled = ATOMIC_VAR_INIT(atomic_load(&s_counters.src_cancelled)),
         .tgt_destroyed = ATOMIC_VAR_INIT(atomic_load(&s_counters.tgt_destroyed)),
         .chk_destroyed = ATOMIC_VAR_INIT(atomic_load(&s_counters.chk_destroyed)),
         .ver_destroyed = ATOMIC_VAR_INIT(atomic_load(&s_counters.ver_destroyed)),
@@ -171,6 +173,19 @@ static esp_err_t mock_src_close(esp_ota_service_source_t *self)
     return b->cfg.close_ret;
 }
 
+static esp_err_t mock_src_cancel(esp_ota_service_source_t *self)
+{
+    mock_src_bundle_t *b = bundle_from_src(self);
+    atomic_fetch_add(&s_counters.src_cancelled, 1);
+    if (b->cfg.cancel_reached_sem) {
+        xSemaphoreGive(b->cfg.cancel_reached_sem);
+    }
+    if (b->cfg.cancel_unblock_read_sem) {
+        xSemaphoreGive(b->cfg.cancel_unblock_read_sem);
+    }
+    return b->cfg.cancel_ret;
+}
+
 static void mock_src_destroy(esp_ota_service_source_t *self)
 {
     mock_src_bundle_t *b = bundle_from_src(self);
@@ -192,6 +207,7 @@ esp_ota_service_source_t *esp_ota_service_mock_source_create(const esp_ota_servi
     b->src.get_size = mock_src_get_size;
     b->src.seek = (!tpl || tpl->provide_seek) ? mock_src_seek : NULL;
     b->src.close = mock_src_close;
+    b->src.cancel = (tpl && tpl->provide_cancel) ? mock_src_cancel : NULL;
     b->src.destroy = mock_src_destroy;
     b->src.priv = &b->cfg;
     atomic_fetch_add(&s_counters.src_created, 1);
@@ -302,6 +318,18 @@ static esp_err_t mock_tgt_write(esp_ota_service_target_t *self, const uint8_t *d
     return ESP_OK;
 }
 
+static esp_err_t mock_tgt_read(esp_ota_service_target_t *self, uint32_t offset,
+                               uint8_t *data, size_t len)
+{
+    mock_tgt_bundle_t *b = bundle_from_tgt(self);
+    if (!data || !b->cfg.read_data || offset > b->cfg.read_len ||
+        len > b->cfg.read_len - offset) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memcpy(data, b->cfg.read_data + offset, len);
+    return ESP_OK;
+}
+
 static esp_err_t mock_tgt_commit(esp_ota_service_target_t *self)
 {
     mock_tgt_bundle_t *b = bundle_from_tgt(self);
@@ -362,6 +390,7 @@ esp_ota_service_target_t *esp_ota_service_mock_target_create(const esp_ota_servi
     }
     b->last_set_off = -1;
     b->tgt.open = mock_tgt_open;
+    b->tgt.read = mock_tgt_read;
     b->tgt.write = mock_tgt_write;
     b->tgt.commit = mock_tgt_commit;
     b->tgt.abort = mock_tgt_abort;

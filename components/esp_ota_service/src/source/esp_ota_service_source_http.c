@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "esp_gmf_io.h"
 #include "esp_gmf_io_http.h"
@@ -42,6 +43,7 @@ typedef struct {
     size_t               leftover_size;
     size_t               leftover_offset;
     bool                 eof;
+    atomic_bool          cancel_requested;
 } esp_ota_service_source_http_priv_t;
 
 static const char *TAG = "OTA_SRC_HTTP";
@@ -50,7 +52,21 @@ static esp_err_t http_open(esp_ota_service_source_t *self, const char *uri)
 {
     esp_ota_service_source_http_priv_t *priv = (esp_ota_service_source_http_priv_t *)self->priv;
 
-    esp_gmf_err_t ret = esp_gmf_io_set_uri(priv->io, uri);
+    if (atomic_load(&priv->cancel_requested)) {
+        ESP_LOGW(TAG, "HTTP open skipped because cancellation was already requested");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* A normal reopen (for resume) must start from a clean GMF state.  A
+     * cancelled source never reaches this point because cancel_requested is
+     * sticky for the lifetime of this source object. */
+    esp_gmf_err_t ret = esp_gmf_io_clear_abort(priv->io);
+    if (ret != ESP_GMF_ERR_OK) {
+        ESP_LOGE(TAG, "Failed to clear GMF abort before open: %d", ret);
+        return ESP_FAIL;
+    }
+
+    ret = esp_gmf_io_set_uri(priv->io, uri);
     if (ret != ESP_GMF_ERR_OK) {
         ESP_LOGE(TAG, "Failed to set URI: %s", uri);
         return ESP_FAIL;
@@ -81,6 +97,10 @@ static esp_err_t http_open(esp_ota_service_source_t *self, const char *uri)
 static int http_read(esp_ota_service_source_t *self, uint8_t *buf, int len)
 {
     esp_ota_service_source_http_priv_t *priv = (esp_ota_service_source_http_priv_t *)self->priv;
+
+    if (atomic_load(&priv->cancel_requested)) {
+        return -1;
+    }
 
     /* Drain leftover from a previous oversized block */
     if (priv->leftover_size > 0) {
@@ -183,6 +203,30 @@ static esp_err_t http_close(esp_ota_service_source_t *self)
     return ESP_OK;
 }
 
+static esp_err_t http_cancel(esp_ota_service_source_t *self)
+{
+    if (self == NULL || self->priv == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_ota_service_source_http_priv_t *priv = (esp_ota_service_source_http_priv_t *)self->priv;
+    atomic_store(&priv->cancel_requested, true);
+    if (priv->io == NULL) {
+        return ESP_OK;
+    }
+
+    /* Do not close or destroy GMF from the stop caller.  abort() wakes the
+     * consumer blocked in acquire_read(); the OTA worker then owns close(),
+     * including the HTTP socket shutdown, before it signals stop_sem. */
+    esp_gmf_err_t ret = esp_gmf_io_abort(priv->io);
+    if (ret != ESP_GMF_ERR_OK) {
+        ESP_LOGW(TAG, "GMF IO abort request failed: %d", ret);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "HTTP source cancellation requested");
+    return ESP_OK;
+}
+
 static void http_destroy(esp_ota_service_source_t *self)
 {
     if (self) {
@@ -254,12 +298,14 @@ esp_err_t esp_ota_service_source_http_create(const esp_ota_service_source_http_c
     priv->io = io;
     priv->wait_ticks = (timeout_ms > 0) ? pdMS_TO_TICKS(timeout_ms) : portMAX_DELAY;
     priv->content_length = -1;
+    atomic_init(&priv->cancel_requested, false);
 
     src->open = http_open;
     src->read = http_read;
     src->get_size = http_get_size;
     src->seek = http_seek;
     src->close = http_close;
+    src->cancel = http_cancel;
     src->destroy = http_destroy;
     src->priv = priv;
 

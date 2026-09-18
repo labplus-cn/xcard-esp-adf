@@ -954,6 +954,106 @@ TEST_CASE("(abort) stop during active download yields ABORTED", TAG_GROUP)
     esp_ota_service_mock_assert_all_destroyed();
 }
 
+TEST_CASE("(abort) destroy defers while a non-cancellable read is blocked", TAG_GROUP)
+{
+    esp_ota_service_mock_counters_reset();
+    esp_ota_service_test_service_cfg_t svc_cfg = {.stop_timeout_ms = 1000};
+    esp_ota_service_t *svc = esp_ota_service_test_create_service(&svc_cfg);
+
+    SemaphoreHandle_t read_reached = xSemaphoreCreateBinary();
+    SemaphoreHandle_t read_continue = xSemaphoreCreateBinary();
+    TEST_ASSERT_NOT_NULL(read_reached);
+    TEST_ASSERT_NOT_NULL(read_continue);
+
+    static const uint8_t payload[] = {0x7a};
+    esp_ota_service_mock_src_cfg_t scfg = {
+        .data = payload,
+        .len = sizeof(payload),
+        .chunk_size = 1,
+        .provide_seek = true,
+        .read_reached_sem = read_reached,
+        .read_continue_sem = read_continue,
+        .provide_cancel = false,
+    };
+    esp_ota_service_mock_tgt_cfg_t tcfg = {0};
+    esp_ota_upgrade_item_t item = {
+        .uri = "mock://blocked-destroy",
+        .partition_label = "app",
+        .source = esp_ota_service_mock_source_create(&scfg),
+        .target = esp_ota_service_mock_target_create(&tcfg),
+    };
+
+    TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_set_upgrade_list(svc, &item, 1));
+    TEST_ASSERT_EQUAL(ESP_OK, esp_service_start((esp_service_t *)svc));
+    TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(read_reached, pdMS_TO_TICKS(5000)));
+
+    esp_err_t first_destroy = esp_ota_service_destroy(svc);
+    esp_ota_service_mock_counters_t before_release = esp_ota_service_mock_counters_snapshot();
+    TEST_ASSERT_EQUAL_INT(0, atomic_load(&before_release.src_destroyed));
+    TEST_ASSERT_EQUAL_INT(0, atomic_load(&before_release.tgt_destroyed));
+
+    xSemaphoreGive(read_continue);
+    TEST_ASSERT_TRUE(esp_ota_service_test_recorder_wait_session_end(5000));
+    TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_destroy(svc));
+
+    vSemaphoreDelete(read_reached);
+    vSemaphoreDelete(read_continue);
+    esp_ota_service_mock_assert_all_destroyed();
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, first_destroy);
+}
+
+TEST_CASE("(abort) controlled source cancel unblocks read before destruction", TAG_GROUP)
+{
+    esp_ota_service_mock_counters_reset();
+    esp_ota_service_test_service_cfg_t svc_cfg = {.stop_timeout_ms = 1000};
+    esp_ota_service_t *svc = esp_ota_service_test_create_service(&svc_cfg);
+
+    SemaphoreHandle_t read_reached = xSemaphoreCreateBinary();
+    SemaphoreHandle_t read_continue = xSemaphoreCreateBinary();
+    SemaphoreHandle_t cancel_reached = xSemaphoreCreateBinary();
+    TEST_ASSERT_NOT_NULL(read_reached);
+    TEST_ASSERT_NOT_NULL(read_continue);
+    TEST_ASSERT_NOT_NULL(cancel_reached);
+
+    static const uint8_t payload[] = {0x5c};
+    esp_ota_service_mock_src_cfg_t scfg = {
+        .data = payload,
+        .len = sizeof(payload),
+        .chunk_size = 1,
+        .provide_seek = true,
+        .read_reached_sem = read_reached,
+        .read_continue_sem = read_continue,
+        .provide_cancel = true,
+        .cancel_reached_sem = cancel_reached,
+        .cancel_unblock_read_sem = read_continue,
+    };
+    esp_ota_service_mock_tgt_cfg_t tcfg = {0};
+    esp_ota_upgrade_item_t item = {
+        .uri = "mock://controlled-cancel",
+        .partition_label = "app",
+        .source = esp_ota_service_mock_source_create(&scfg),
+        .target = esp_ota_service_mock_target_create(&tcfg),
+    };
+
+    TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_set_upgrade_list(svc, &item, 1));
+    TEST_ASSERT_EQUAL(ESP_OK, esp_service_start((esp_service_t *)svc));
+    TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(read_reached, pdMS_TO_TICKS(5000)));
+
+    esp_err_t stop_ret = esp_service_stop((esp_service_t *)svc);
+    TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(cancel_reached, pdMS_TO_TICKS(1000)));
+    TEST_ASSERT_TRUE(esp_ota_service_test_recorder_wait_session_end(5000));
+
+    esp_ota_service_mock_counters_t counters = esp_ota_service_mock_counters_snapshot();
+    TEST_ASSERT_EQUAL_INT(1, atomic_load(&counters.src_cancelled));
+    TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_destroy(svc));
+
+    vSemaphoreDelete(read_reached);
+    vSemaphoreDelete(read_continue);
+    vSemaphoreDelete(cancel_reached);
+    esp_ota_service_mock_assert_all_destroyed();
+    TEST_ASSERT_EQUAL(ESP_OK, stop_ret);
+}
+
 TEST_CASE("(abort) set_upgrade_list refused in RUNNING and cleans up", TAG_GROUP)
 {
     esp_ota_service_mock_counters_reset();
@@ -1469,7 +1569,12 @@ TEST_CASE("(resume) save / load / clear round-trip", TAG_GROUP)
     esp_ota_service_resume_point_t saved = {
         .item_index = 2,
         .written_bytes = 4096,
+        .image_size = 8192,
+        .has_sha256 = true,
     };
+    for (size_t i = 0; i < sizeof(saved.sha256); ++i) {
+        saved.sha256[i] = (uint8_t)i;
+    }
     strncpy(saved.uri, "mock://resume/round-trip", sizeof(saved.uri) - 1);
 
     TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_resume_save(&saved));
@@ -1479,6 +1584,9 @@ TEST_CASE("(resume) save / load / clear round-trip", TAG_GROUP)
     TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_resume_load(saved.item_index, &loaded));
     TEST_ASSERT_EQUAL_INT8(saved.item_index, loaded.item_index);
     TEST_ASSERT_EQUAL_UINT32(saved.written_bytes, loaded.written_bytes);
+    TEST_ASSERT_EQUAL_UINT32(saved.image_size, loaded.image_size);
+    TEST_ASSERT_TRUE(loaded.has_sha256);
+    TEST_ASSERT_EQUAL_MEMORY(saved.sha256, loaded.sha256, sizeof(saved.sha256));
     TEST_ASSERT_EQUAL_STRING(saved.uri, loaded.uri);
 
     TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_resume_clear(saved.item_index));
@@ -1533,11 +1641,8 @@ TEST_CASE("(resume) service seeks and sets target offset from NVS", TAG_GROUP)
     const uint32_t resume_at = 128;
     const char *uri = "mock://resume/honour";
 
-    /* Seed the resume point BEFORE the service loads its upgrade list. The
-     * subsequent set_upgrade_list() would clear_all, so we write the record
-     * AFTER it instead.  Ordering: create → set_upgrade_list (clears) →
-     * save resume point → esp_service_start → worker loads it.
-     */
+    /* Seed the resume point after installing the list so the test controls
+     * the exact record consumed by the worker. */
     esp_ota_service_t *svc = esp_ota_service_test_create_service(NULL);
 
     esp_ota_service_source_t *src = NULL;
@@ -1548,11 +1653,11 @@ TEST_CASE("(resume) service seeks and sets target offset from NVS", TAG_GROUP)
 
     TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_set_upgrade_list(svc, &owned, 1));
 
-    /* Seed the persistent resume record AFTER set_upgrade_list (which does a
-     * clear_all under the hood). */
+    /* Seed the persistent resume record after set_upgrade_list. */
     esp_ota_service_resume_point_t rp = {
         .item_index = 0,
         .written_bytes = resume_at,
+        .image_size = sizeof(payload),
     };
     strncpy(rp.uri, uri, sizeof(rp.uri) - 1);
     TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_resume_save(&rp));
@@ -1716,7 +1821,67 @@ TEST_CASE("(resume) stale target triggers source reopen and restart", TAG_GROUP)
     esp_ota_service_mock_assert_all_destroyed();
 }
 
-TEST_CASE("(resume) set_upgrade_list clears every persisted record", TAG_GROUP)
+TEST_CASE("(resume) verifier replays persisted prefix before suffix", TAG_GROUP)
+{
+    rs_clean_resume_namespace();
+    esp_ota_service_mock_counters_reset();
+
+    static uint8_t payload[256];
+    for (size_t i = 0; i < sizeof(payload); ++i) {
+        payload[i] = (uint8_t)(i ^ 0x5A);
+    }
+    const char *uri = "mock://resume/verifier-prefix";
+    const uint32_t resume_at = 128;
+
+    esp_ota_service_t *svc = esp_ota_service_test_create_service(NULL);
+    esp_ota_service_mock_src_cfg_t scfg = {
+        .data = payload,
+        .len = sizeof(payload),
+        .chunk_size = 64,
+        .provide_seek = true,
+    };
+    esp_ota_service_mock_tgt_cfg_t tcfg = {
+        .provide_offset_hooks = true,
+        .read_data = payload,
+        .read_len = sizeof(payload),
+    };
+    esp_ota_service_mock_ver_cfg_t vcfg = {0};
+    esp_ota_service_source_t *src = esp_ota_service_mock_source_create(&scfg);
+    esp_ota_service_target_t *tgt = esp_ota_service_mock_target_create(&tcfg);
+    esp_ota_service_verifier_t *ver = esp_ota_service_mock_verifier_create(&vcfg);
+    esp_ota_upgrade_item_t item = {
+        .uri = uri,
+        .partition_label = "app",
+        .source = src,
+        .target = tgt,
+        .verifier = ver,
+        .resumable = true,
+        .expected_size = sizeof(payload),
+    };
+    TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_set_upgrade_list(svc, &item, 1));
+
+    esp_ota_service_resume_point_t rp = {
+        .item_index = 0,
+        .written_bytes = resume_at,
+        .image_size = sizeof(payload),
+    };
+    strncpy(rp.uri, uri, sizeof(rp.uri) - 1);
+    TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_resume_save(&rp));
+
+    esp_ota_service_test_recorder_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, esp_service_start((esp_service_t *)svc));
+    TEST_ASSERT_TRUE(esp_ota_service_test_recorder_wait_session_end(10000));
+
+    TEST_ASSERT_EQUAL_UINT(sizeof(payload),
+                           esp_ota_service_mock_verifier_bytes_seen(ver));
+    TEST_ASSERT_EQUAL_UINT(sizeof(payload),
+                           esp_ota_service_mock_target_bytes_written(tgt));
+
+    esp_ota_service_test_destroy_service(svc);
+    esp_ota_service_mock_assert_all_destroyed();
+}
+
+TEST_CASE("(resume) set_upgrade_list preserves records for URI matching", TAG_GROUP)
 {
     rs_clean_resume_namespace();
     esp_ota_service_mock_counters_reset();
@@ -1736,7 +1901,8 @@ TEST_CASE("(resume) set_upgrade_list clears every persisted record", TAG_GROUP)
     TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_resume_load(0, &loaded));
     TEST_ASSERT_EQUAL_UINT32(42, loaded.written_bytes);
 
-    /* Now install a list — documented to drop every resume record. */
+    /* Installing a list must not erase records.  The worker validates the
+     * item identity before consuming a matching record. */
     esp_ota_service_mock_src_cfg_t scfg = {.data = (const uint8_t *)"\x00", .len = 1, .provide_seek = true};
     esp_ota_service_mock_tgt_cfg_t tcfg = {.provide_offset_hooks = true};
     esp_ota_upgrade_item_t item = {
@@ -1747,9 +1913,14 @@ TEST_CASE("(resume) set_upgrade_list clears every persisted record", TAG_GROUP)
     };
     TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_set_upgrade_list(svc, &item, 1));
 
-    for (int i = 0; i < 3; ++i) {
-        TEST_ASSERT_EQUAL(ESP_ERR_NVS_NOT_FOUND, esp_ota_service_resume_load(i, &loaded));
-    }
+    TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_resume_load(0, &loaded));
+    TEST_ASSERT_EQUAL_UINT32(42, loaded.written_bytes);
+    TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_resume_load(1, &loaded));
+    TEST_ASSERT_EQUAL_UINT32(42, loaded.written_bytes);
+    TEST_ASSERT_EQUAL(ESP_OK, esp_ota_service_resume_load(2, &loaded));
+    TEST_ASSERT_EQUAL_UINT32(42, loaded.written_bytes);
+
+    rs_clean_resume_namespace();
 
     esp_ota_service_test_destroy_service(svc);
     esp_ota_service_mock_assert_all_destroyed();

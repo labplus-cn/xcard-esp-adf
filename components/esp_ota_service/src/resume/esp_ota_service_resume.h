@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -23,6 +24,9 @@ extern "C" {
 typedef struct {
     int8_t    item_index;     /*!< Upgrade item index this record belongs to */
     uint32_t  written_bytes;  /*!< Bytes already written to the target */
+    uint32_t  image_size;     /*!< Expected complete image size, 0 when unknown */
+    bool      has_sha256;     /*!< True when sha256 contains the image identity */
+    uint8_t   sha256[32];     /*!< Expected complete image SHA-256 */
     char      uri[256];       /*!< Source URI (truncated to 255 chars + NUL; the
                                *   service refuses longer URIs to avoid silent
                                *   truncation). */
@@ -71,9 +75,9 @@ esp_err_t esp_ota_service_resume_clear(int item_index);
 /**
  * @brief  Clear every resume record in the namespace
  *
- *         Typically called by the OTA session before a brand-new run, so
- *         stale records from a previous configuration cannot be picked up
- *         by mistake.
+ *         This is an explicit administrative reset.  Normal OTA sessions
+ *         retain records and validate each record against the current URI,
+ *         size, and optional SHA-256 identity before resuming.
  *
  * @return
  *       - ESP_OK  On success, or if the resume namespace does not exist

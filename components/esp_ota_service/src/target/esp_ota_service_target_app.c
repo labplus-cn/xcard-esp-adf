@@ -127,6 +127,19 @@ static esp_err_t app_write(esp_ota_service_target_t *self, const uint8_t *data, 
     return ESP_OK;
 }
 
+static esp_err_t app_read(esp_ota_service_target_t *self, uint32_t offset,
+                           uint8_t *data, size_t len)
+{
+    esp_ota_service_target_app_priv_t *priv = (esp_ota_service_target_app_priv_t *)self->priv;
+    if (!priv->opened || priv->update_partition == NULL || data == NULL || len == 0 ||
+        offset > priv->update_partition->size ||
+        len > priv->update_partition->size - offset) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return esp_partition_read(priv->update_partition, offset, data, len);
+}
+
 static esp_err_t app_commit(esp_ota_service_target_t *self)
 {
     esp_ota_service_target_app_priv_t *priv = (esp_ota_service_target_app_priv_t *)self->priv;
@@ -230,6 +243,7 @@ esp_err_t esp_ota_service_target_app_create(const esp_ota_service_target_app_cfg
     priv->bulk_flash_erase = cfg ? cfg->bulk_flash_erase : false;
 
     tgt->open = app_open;
+    tgt->read = app_read;
     tgt->write = app_write;
     tgt->commit = app_commit;
     tgt->abort = app_abort;

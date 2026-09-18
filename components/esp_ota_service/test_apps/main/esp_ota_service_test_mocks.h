@@ -39,6 +39,7 @@ extern "C" {
 
 typedef struct {
     atomic_int  src_destroyed;
+    atomic_int  src_cancelled;
     atomic_int  tgt_destroyed;
     atomic_int  chk_destroyed;
     atomic_int  ver_destroyed;
@@ -76,6 +77,7 @@ typedef struct {
     /* Return codes injected into each hook. */
     esp_err_t  open_ret;
     esp_err_t  close_ret;
+    esp_err_t  cancel_ret;
     esp_err_t  seek_ret;
 
     /* Stream shaping. */
@@ -93,6 +95,13 @@ typedef struct {
     /* Optional gating for tests that need the worker to pause mid-read. */
     SemaphoreHandle_t  read_reached_sem;   /*!< Given once at first read() entry */
     SemaphoreHandle_t  read_continue_sem;  /*!< Taken once at first read() before returning */
+
+    /* Optional controlled-cancel hook.  When enabled, cancel() can release a
+     * blocked read so lifecycle tests can verify that stop waits for the worker
+     * rather than destroying the source from the caller task. */
+    bool               provide_cancel;
+    SemaphoreHandle_t  cancel_reached_sem;       /*!< Given when cancel() is entered */
+    SemaphoreHandle_t  cancel_unblock_read_sem;  /*!< Given by cancel() to release read() */
 
     /* Seek shaping. */
     int  seek_fail_count;  /*!< Fail the first N seek() calls */
@@ -135,6 +144,10 @@ typedef struct {
     esp_err_t  write_ret;
     esp_err_t  commit_ret;
     esp_err_t  abort_ret;
+
+    /* Optional read-back data used by resume verifier tests. */
+    const uint8_t *read_data;
+    size_t         read_len;
 
     /* Write shaping. */
     size_t  write_fail_after_bytes;  /*!< Fail write once written_total >= this; 0 disables */

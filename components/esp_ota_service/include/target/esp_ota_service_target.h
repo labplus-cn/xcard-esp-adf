@@ -40,6 +40,23 @@ typedef struct esp_ota_service_target {
     esp_err_t (*open)(struct esp_ota_service_target *self, const char *partition_label);
 
     /**
+     * @brief  Read bytes already present in the target partition
+     *
+     *         Used only to seed a streaming verifier before a resumable
+     *         suffix is downloaded.  Set to NULL when the target cannot
+     *         safely read back its persisted prefix.
+     *
+     * @param[in]  self    Target instance
+     * @param[in]  offset  Byte offset within the target partition
+     * @param[out] data    Destination buffer
+     * @param[in]  len     Number of bytes to read
+     *
+     * @return ESP_OK on success, or an implementation-specific error.
+     */
+    esp_err_t (*read)(struct esp_ota_service_target *self, uint32_t offset,
+                      uint8_t *data, size_t len);
+
+    /**
      * @brief  Write a data chunk to the target partition
      *
      * @param[in]  self  Target instance

@@ -58,6 +58,7 @@ struct esp_ota_service {
     /* Worker task coordination */
     TaskHandle_t       worker_task;
     SemaphoreHandle_t  stop_sem;  /* Given by worker AFTER it has finished touching the service. */
+    atomic_bool        worker_started;
     atomic_bool        abort_requested;
     atomic_bool        paused;
 
@@ -173,11 +174,79 @@ static void free_upgrade_list(esp_ota_upgrade_item_t *list, int count)
     adf_free(list);
 }
 
+#if CONFIG_OTA_ENABLE_RESUME
+static bool resume_point_matches_item(const esp_ota_service_resume_point_t *point,
+                                      const esp_ota_upgrade_item_t *item)
+{
+    if (point == NULL || item == NULL || point->written_bytes == 0 ||
+        point->item_index < 0 || strcmp(point->uri, item->uri) != 0) {
+        return false;
+    }
+    if (item->expected_size != 0 &&
+        (point->image_size != item->expected_size ||
+         point->written_bytes >= item->expected_size)) {
+        return false;
+    }
+    if (item->has_expected_sha256 &&
+        (!point->has_sha256 || memcmp(point->sha256, item->expected_sha256,
+                                      sizeof(item->expected_sha256)) != 0)) {
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t replay_resume_prefix(esp_ota_service_verifier_t *ver,
+                                      esp_ota_service_target_t *tgt,
+                                      uint32_t resume_offset)
+{
+    if (resume_offset == 0 || ver == NULL) {
+        return ESP_OK;
+    }
+    if (tgt == NULL || tgt->read == NULL || ver->verify_update == NULL) {
+        ESP_LOGE(TAG, "Resume verifier requires target read-back and verifier update hooks");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    const size_t chunk_size = 4096;
+    uint8_t *prefix = heap_caps_malloc(chunk_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (prefix == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t ret = ESP_OK;
+    uint32_t offset = 0;
+    while (offset < resume_offset) {
+        const size_t remaining = resume_offset - offset;
+        const size_t chunk = remaining < chunk_size ? remaining : chunk_size;
+        ret = tgt->read(tgt, offset, prefix, chunk);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Resume prefix read failed at offset=%" PRIu32 ": %s",
+                     offset, esp_err_to_name(ret));
+            break;
+        }
+        ret = ver->verify_update(ver, prefix, chunk);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Resume prefix verification failed at offset=%" PRIu32 ": %s",
+                     offset, esp_err_to_name(ret));
+            break;
+        }
+        offset += (uint32_t)chunk;
+    }
+
+    free(prefix);
+    return ret;
+}
+#endif  /* CONFIG_OTA_ENABLE_RESUME */
+
 static esp_err_t process_item(esp_ota_service_t *ota, const esp_ota_upgrade_item_t *item, int idx)
 {
     esp_ota_service_source_t *src = item->source;
     esp_ota_service_target_t *tgt = item->target;
     esp_ota_service_verifier_t *ver = item->verifier;
+
+    if (atomic_load(&ota->abort_requested)) {
+        return ESP_ERR_TIMEOUT;
+    }
 
     atomic_store(&ota->bytes_written, 0);
     atomic_store(&ota->total_bytes, UINT32_MAX);
@@ -186,10 +255,14 @@ static esp_err_t process_item(esp_ota_service_t *ota, const esp_ota_upgrade_item
     uint32_t resume_offset = 0;
     if (item->resumable) {
         esp_ota_service_resume_point_t rp;
-        if (esp_ota_service_resume_load(idx, &rp) == ESP_OK && rp.item_index == (int8_t)idx &&
-            strcmp(rp.uri, item->uri) == 0 && rp.written_bytes > 0) {
+        const esp_err_t resume_ret = esp_ota_service_resume_load(idx, &rp);
+        if (resume_ret == ESP_OK && rp.item_index == (int8_t)idx &&
+            resume_point_matches_item(&rp, item)) {
             resume_offset = rp.written_bytes;
             ESP_LOGI(TAG, "[%d] Resuming from offset %" PRIu32, idx, resume_offset);
+        } else if (resume_ret == ESP_OK) {
+            ESP_LOGW(TAG, "[%d] Saved resume identity does not match current item; restarting",
+                     idx);
         }
     }
 #endif  /* CONFIG_OTA_ENABLE_RESUME */
@@ -199,7 +272,15 @@ static esp_err_t process_item(esp_ota_service_t *ota, const esp_ota_upgrade_item
         ESP_LOGE(TAG, "[%d] Source open failed: %s", idx, esp_err_to_name(ret));
         return ret;
     }
+    if (atomic_load(&ota->abort_requested)) {
+        src->close(src);
+        return ESP_ERR_TIMEOUT;
+    }
     atomic_store(&ota->total_bytes, esp_ota_service_total_bytes_from_source_size(src->get_size(src)));
+    if (atomic_load(&ota->abort_requested)) {
+        src->close(src);
+        return ESP_ERR_TIMEOUT;
+    }
 
 #if CONFIG_OTA_ENABLE_RESUME
     if (item->resumable && resume_offset > 0) {
@@ -263,6 +344,17 @@ static esp_err_t process_item(esp_ota_service_t *ota, const esp_ota_upgrade_item
         }
         atomic_store(&ota->total_bytes, esp_ota_service_total_bytes_from_source_size(src->get_size(src)));
         (void)esp_ota_service_resume_clear(idx);
+    }
+#endif  /* CONFIG_OTA_ENABLE_RESUME */
+
+#if CONFIG_OTA_ENABLE_RESUME
+    if (item->resumable && resume_offset > 0) {
+        ret = replay_resume_prefix(ver, tgt, resume_offset);
+        if (ret != ESP_OK) {
+            tgt->abort(tgt);
+            src->close(src);
+            return ret;
+        }
     }
 #endif  /* CONFIG_OTA_ENABLE_RESUME */
 
@@ -336,6 +428,13 @@ static esp_err_t process_item(esp_ota_service_t *ota, const esp_ota_upgrade_item
                 snprintf(rp.uri, sizeof(rp.uri), "%s", item->uri);
                 rp.written_bytes = written_now;
                 rp.item_index = (int8_t)idx;
+                rp.image_size = item->expected_size != 0 ? item->expected_size :
+                                (atomic_load(&ota->total_bytes) == UINT32_MAX ? 0 :
+                                 atomic_load(&ota->total_bytes));
+                rp.has_sha256 = item->has_expected_sha256;
+                if (rp.has_sha256) {
+                    memcpy(rp.sha256, item->expected_sha256, sizeof(rp.sha256));
+                }
                 (void)esp_ota_service_resume_save(&rp);
                 bytes_since_last_save = 0;
             }
@@ -628,9 +727,10 @@ static esp_err_t esp_ota_service_on_start(esp_service_t *base)
         }
     }
 
+    atomic_store(&ota->worker_started, false);
     atomic_store(&ota->abort_requested, false);
     atomic_store(&ota->paused, false);
-    atomic_store(&ota->current_item, 0);
+    atomic_store(&ota->current_item, -1);
     atomic_store(&ota->bytes_written, 0);
     atomic_store(&ota->total_bytes, UINT32_MAX);
 
@@ -639,10 +739,15 @@ static esp_err_t esp_ota_service_on_start(esp_service_t *base)
     /* core_id == -1 means no affinity; map to tskNO_AFFINITY (0x7FFFFFFF in IDF 5.x). */
     BaseType_t core_id = (ota->worker_core_id < 0) ? tskNO_AFFINITY : (BaseType_t)ota->worker_core_id;
 
+    /* on_stop may be reached from the service ERROR state if task creation
+     * fails.  Mark the intent before spawning so it can distinguish that
+     * case from the narrow worker_task=NULL -> give(stop_sem) handoff. */
+    atomic_store(&ota->worker_started, true);
     BaseType_t rc = xTaskCreatePinnedToCore(esp_ota_service_worker_task, "esp_ota_svc_wk", ota->worker_stack_size, ota,
                                             ota->worker_priority, &ota->worker_task, core_id);
 
     if (rc != pdPASS) {
+        atomic_store(&ota->worker_started, false);
         ESP_LOGE(TAG, "Failed to create OTA worker task (stack=%" PRIu32 " prio=%u)", ota->worker_stack_size,
                  ota->worker_priority);
         return ESP_ERR_NO_MEM;
@@ -653,23 +758,59 @@ static esp_err_t esp_ota_service_on_start(esp_service_t *base)
     return ESP_OK;
 }
 
+static void ota_cancel_active_source(esp_ota_service_t *ota)
+{
+    int item_index = (int)atomic_load(&ota->current_item);
+    if (item_index < 0 || item_index >= ota->upgrade_count || ota->upgrade_list == NULL) {
+        return;
+    }
+
+    esp_ota_service_source_t *source = ota->upgrade_list[item_index].source;
+    if (source == NULL || source->cancel == NULL) {
+        return;
+    }
+
+    /* cancel() is deliberately non-destructive: the worker remains the only
+     * owner allowed to close the source.  This gives a blocked transport a
+     * chance to wake before stop_sem is observed by the caller. */
+    esp_err_t ret = source->cancel(source);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "[%d] Source cancel request failed: %s", item_index, esp_err_to_name(ret));
+    }
+}
+
 static esp_err_t esp_ota_service_on_stop(esp_service_t *base)
 {
     esp_ota_service_t *ota = (esp_ota_service_t *)base;
-    if (ota->worker_task == NULL) {
-        /* No worker was ever started or a previous stop force-cleared it. */
+    /* stop_sem is the only destruction fence.  The worker clears
+     * worker_task immediately before giving this semaphore, so observing a
+     * NULL task handle alone leaves a race in which the worker may still be
+     * about to use stop_sem. */
+    if (xSemaphoreTake(ota->stop_sem, 0) == pdTRUE) {
+        atomic_store(&ota->worker_started, false);
+        ESP_LOGI(TAG, "OTA worker had already stopped cleanly");
+        return ESP_OK;
+    }
+
+    if (!atomic_load(&ota->worker_started)) {
+        /* on_start failed before a worker was created, or a previous stop
+         * already consumed the worker's acknowledgement. */
         return ESP_OK;
     }
 
     ESP_LOGI(TAG, "Requesting OTA worker to stop...");
     atomic_store(&ota->abort_requested, true);
     atomic_store(&ota->paused, false);  /* unblock any active pause */
+    ota_cancel_active_source(ota);
 
     if (xSemaphoreTake(ota->stop_sem, pdMS_TO_TICKS(ota->stop_timeout_ms)) != pdTRUE) {
-        ESP_LOGE(TAG, "OTA worker did not stop within %" PRIu32 " ms - force-deleting task", ota->stop_timeout_ms);
-    } else {
-        ESP_LOGI(TAG, "OTA worker stopped cleanly");
+        ESP_LOGE(TAG,
+                 "OTA worker did not stop within %" PRIu32
+                 " ms; resources are retained until worker exit is acknowledged",
+                 ota->stop_timeout_ms);
+        return ESP_ERR_TIMEOUT;
     }
+    ESP_LOGI(TAG, "OTA worker stopped cleanly");
     return ESP_OK;
 }
 
@@ -740,6 +881,7 @@ esp_err_t esp_ota_service_create(const esp_ota_service_cfg_t *cfg, esp_ota_servi
     }
 
     atomic_store(&ota->total_bytes, UINT32_MAX);
+    atomic_store(&ota->worker_started, false);
 
     ota->stop_sem = xSemaphoreCreateBinary();
     if (!ota->stop_sem) {
@@ -838,9 +980,21 @@ esp_err_t esp_ota_service_destroy(esp_ota_service_t *svc)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* Stop any running upgrade first */
-    esp_service_stop((esp_service_t *)svc);
-    esp_service_deinit((esp_service_t *)svc);
+    /* Destruction is permitted only after on_stop() has observed stop_sem.
+     * Do not call generic deinit on a failed stop: esp_service_deinit() would
+     * otherwise free the event hub while the OTA worker can still publish to
+     * it, and the upgrade list/source/stop semaphore would become dangling. */
+    esp_err_t ret = esp_service_stop((esp_service_t *)svc);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Destroy deferred: OTA worker is still active (%s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_service_deinit((esp_service_t *)svc);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Destroy failed: service deinit returned %s; resources retained", esp_err_to_name(ret));
+        return ret;
+    }
     free_upgrade_list(svc->upgrade_list, svc->upgrade_count);
     vSemaphoreDelete(svc->stop_sem);
     adf_free(svc);
@@ -923,6 +1077,13 @@ esp_err_t esp_ota_service_set_upgrade_list(esp_ota_service_t *svc, const esp_ota
                 destroy_caller_items(list, 0, count);
                 return ESP_ERR_NOT_SUPPORTED;
             }
+            if (list[i].verifier != NULL && list[i].target->read == NULL) {
+                ESP_LOGE(TAG,
+                         "Set upgrade list failed: item[%d].resumable=true with verifier"
+                         " requires target read-back for prefix hashing", i);
+                destroy_caller_items(list, 0, count);
+                return ESP_ERR_NOT_SUPPORTED;
+            }
         }
     }
 
@@ -968,15 +1129,6 @@ esp_err_t esp_ota_service_set_upgrade_list(esp_ota_service_t *svc, const esp_ota
 
     svc->upgrade_list = new_list;
     svc->upgrade_count = count;
-
-#if CONFIG_OTA_ENABLE_RESUME
-    /* Resume records from a previous session are only trustworthy when the
-     * upgrade list matches (same uri at the same index). Re-running
-     * set_upgrade_list is an explicit signal that the configuration might
-     * have changed, so err on the safe side and drop every record. The
-     * per-item load still gates actual use by comparing URI. */
-    (void)esp_ota_service_resume_clear_all();
-#endif  /* CONFIG_OTA_ENABLE_RESUME */
 
     return ESP_OK;
 }
