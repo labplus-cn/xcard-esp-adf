@@ -251,7 +251,7 @@ static esp_err_t cli_on_start(esp_service_t *base)
 
 cleanup:
     if (repl != NULL) {
-        (void)esp_console_stop_repl(repl);
+        (void)repl->del(repl);
     }
     (void)cli_set_repl_state(svc, NULL, false);
     cli_mark_static_commands_registered(svc, false);
@@ -266,13 +266,13 @@ static esp_err_t cli_on_stop(esp_service_t *base)
         return ESP_OK;
     }
 
-    esp_err_t ret = esp_console_stop_repl(svc->repl);
+    esp_err_t ret = svc->repl->del(svc->repl);
     (void)cli_set_repl_state(svc, NULL, false);
     cli_mark_static_commands_registered(svc, false);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Stop 'esp_cli_service': REPL stopped");
     } else {
-        ESP_LOGW(TAG, "Stop 'esp_cli_service': esp_console_stop_repl returned %s; REPL state cleared", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Stop 'esp_cli_service': REPL del returned %s; REPL state cleared", esp_err_to_name(ret));
     }
     return ESP_OK;
 }
@@ -281,7 +281,7 @@ static esp_err_t cli_on_deinit(esp_service_t *base)
 {
     esp_cli_service_t *svc = (esp_cli_service_t *)base;
     if (svc->repl != NULL) {
-        (void)esp_console_stop_repl(svc->repl);
+        (void)svc->repl->del(svc->repl);
     }
     (void)cli_set_repl_state(svc, NULL, false);
     cli_mark_static_commands_registered(svc, false);

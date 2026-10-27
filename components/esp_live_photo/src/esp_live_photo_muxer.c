@@ -746,7 +746,7 @@ static int live_photo_check_file(live_photo_muxer_t *m)
 static esp_muxer_handle_t live_photo_open(esp_muxer_config_t *cfg, uint32_t size)
 {
     if (cfg == NULL || size < sizeof(esp_live_photo_muxer_config_t)) {
-        ESP_LOGE(TAG, "Invalid argument cfg:%p size:%d", cfg, size);
+        ESP_LOGE(TAG, "Invalid argument cfg:%p size:%u", cfg, (unsigned int)size);
         return NULL;
     }
     esp_live_photo_muxer_config_t *lp_cfg = (esp_live_photo_muxer_config_t *)cfg;
